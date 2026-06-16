@@ -9,6 +9,7 @@
 #include "x86/isr.h"
 
 #define IPI_TEST_VECTOR	0xb0
+#define DECODE_ASSIST_ITERATIONS	(1024U * 1024U)
 
 struct test {
 	void (*func)(void);
@@ -16,12 +17,15 @@ struct test {
 	int (*valid)(void);
 	int parallel;
 	bool (*next)(struct test *);
+	unsigned int loop_iterations;
+	unsigned int exits_per_loop;
 };
 
 #define GOAL (1ull << 30)
 
 static int nr_cpus;
 static u64 cr4_shadow;
+static bool vmexit_reported;
 
 static void cpuid_test(void)
 {
@@ -491,6 +495,33 @@ static void toggle_cr4_pge(void)
 	write_cr4(cr4_shadow);
 }
 
+static void invlpg_loop(void)
+{
+	unsigned int count = DECODE_ASSIST_ITERATIONS;
+	unsigned long addr = (unsigned long)&x;
+
+	asm volatile("1: invlpg (%%" R "ax)\n\t"
+		     "decl %%ecx\n\t"
+		     "jnz 1b"
+		     : "+c"(count)
+		     : "a"(addr)
+		     : "memory");
+}
+
+static void cr3_read_write_loop(void)
+{
+	unsigned int count = DECODE_ASSIST_ITERATIONS;
+	unsigned long cr3;
+
+	asm volatile("1: mov %%cr3, %0\n\t"
+		     "mov %0, %%cr3\n\t"
+		     "decl %%ecx\n\t"
+		     "jnz 1b"
+		     : "=&r"(cr3), "+c"(count)
+		     :
+		     : "memory");
+}
+
 static struct test tests[] = {
 	{ cpuid_test, "cpuid", .parallel = 1,  },
 	{ vmcall, "vmcall", .parallel = 1, },
@@ -528,6 +559,12 @@ static struct test tests[] = {
 	{ rd_tsc_adjust_msr, "rd_tsc_adjust_msr", .parallel = 1 },
 	{ toggle_cr0_wp, "toggle_cr0_wp" , .parallel = 1, },
 	{ toggle_cr4_pge, "toggle_cr4_pge" , .parallel = 1, },
+	{ invlpg_loop, "invlpg_loop",
+		.loop_iterations = DECODE_ASSIST_ITERATIONS,
+		.exits_per_loop = 1, },
+	{ cr3_read_write_loop, "cr3_read_write_loop",
+		.loop_iterations = DECODE_ASSIST_ITERATIONS,
+		.exits_per_loop = 2, },
 	{ NULL, "pci-mem", .parallel = 0, .next = pci_mem_next },
 	{ NULL, "pci-io", .parallel = 0, .next = pci_io_next },
 };
@@ -548,6 +585,7 @@ static bool do_test(struct test *test)
 	int i;
 	unsigned long long t1, t2;
         void (*func)(void);
+	unsigned long long cycles, nr_exits;
 
         iterations = 32;
 
@@ -561,8 +599,22 @@ static bool do_test(struct test *test)
 	}
 
 	func = test->func;
-        if (!func) {
+	if (!func) {
 		printf("%s (skipped)\n", test->name);
+		return false;
+	}
+
+	if (test->loop_iterations) {
+		t1 = fenced_rdtsc();
+		func();
+		t2 = fenced_rdtsc();
+		cycles = t2 - t1;
+		nr_exits = (unsigned long long)test->loop_iterations *
+			   test->exits_per_loop;
+		printf("%s total %llu exits %llu cycles/exit %llu\n",
+		       test->name, cycles, nr_exits, cycles / nr_exits);
+		report_pass("%s", test->name);
+		vmexit_reported = true;
 		return false;
 	}
 
@@ -638,6 +690,9 @@ int main(int ac, char **av)
 	for (i = 0; i < ARRAY_SIZE(tests); ++i)
 		if (test_wanted(&tests[i], av + 1, ac - 1))
 			while (do_test(&tests[i])) {}
+
+	if (vmexit_reported)
+		return report_summary();
 
 	return 0;
 }
