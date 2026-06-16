@@ -288,6 +288,88 @@ static void basic_guest_main(struct svm_test *test)
 {
 }
 
+extern const u8 svm_decode_assist_load_insn[];
+extern const u8 svm_decode_assist_load_insn_end[];
+extern const u8 svm_decode_assist_store_insn[];
+extern const u8 svm_decode_assist_store_insn_end[];
+
+#define SVM_DECODE_ASSIST_NPF_GPA	0x80000
+
+static void svm_decode_assist_load_guest(struct svm_test *test)
+{
+	asm volatile("mov %0, %%eax\n\t"
+		     ".globl svm_decode_assist_load_insn\n\t"
+		     "svm_decode_assist_load_insn:\n\t"
+		     "movl (%%rax), %%edx\n\t"
+		     ".globl svm_decode_assist_load_insn_end\n\t"
+		     "svm_decode_assist_load_insn_end:\n\t"
+		     :
+		     : "i"(SVM_DECODE_ASSIST_NPF_GPA)
+		     : "rax", "rdx", "memory");
+}
+
+static void svm_decode_assist_store_guest(struct svm_test *test)
+{
+	asm volatile("mov %0, %%eax\n\t"
+		     "mov $0, %%edx\n\t"
+		     ".globl svm_decode_assist_store_insn\n\t"
+		     "svm_decode_assist_store_insn:\n\t"
+		     "movl %%edx, (%%rax)\n\t"
+		     ".globl svm_decode_assist_store_insn_end\n\t"
+		     "svm_decode_assist_store_insn_end:\n\t"
+		     :
+		     : "i"(SVM_DECODE_ASSIST_NPF_GPA)
+		     : "rax", "rdx", "memory");
+}
+
+static void svm_decode_assist_check(const char *name, test_guest_func guest,
+				    const u8 *expected_bytes,
+				    const u8 *expected_bytes_end)
+{
+	u64 *pte = npt_get_pte(SVM_DECODE_ASSIST_NPF_GPA);
+	unsigned int expected_len = expected_bytes_end - expected_bytes;
+	u64 pte_orig = *pte;
+
+	*pte &= ~PT_PRESENT_MASK;
+	vmcb->control.tlb_ctl = TLB_CONTROL_FLUSH_ALL_ASID;
+
+	test_set_guest(guest);
+	svm_vmrun();
+
+	report(vmcb->control.exit_code == SVM_EXIT_NPF,
+	       "%s: nested #NPF exit", name);
+
+	report(vmcb->control.insn_len >= expected_len,
+	       "%s: DecodeAssist insn_len covers expected bytes (expected at least %u, got %u)",
+	       name, expected_len, vmcb->control.insn_len);
+
+	report(!memcmp(vmcb->control.insn_bytes, expected_bytes, expected_len),
+	       "%s: DecodeAssist insn_bytes (expected %02x %02x, got %02x %02x)",
+	       name, expected_bytes[0], expected_bytes[1],
+	       vmcb->control.insn_bytes[0], vmcb->control.insn_bytes[1]);
+
+	*pte = pte_orig;
+	vmcb->control.tlb_ctl = TLB_CONTROL_FLUSH_ALL_ASID;
+}
+
+static void svm_decode_assist_npt_test(void)
+{
+	if (!npt_supported()) {
+		report_skip("NPT not supported");
+		return;
+	}
+
+	report(this_cpu_has(X86_FEATURE_DECODEASSIST),
+	       "DecodeAssist exposed to L1");
+
+	svm_decode_assist_check("load", svm_decode_assist_load_guest,
+				svm_decode_assist_load_insn,
+				svm_decode_assist_load_insn_end);
+	svm_decode_assist_check("store", svm_decode_assist_store_guest,
+				svm_decode_assist_store_insn,
+				svm_decode_assist_store_insn_end);
+}
+
 static void __svm_npt_rsvd_bits_test(u64 * pxe, u64 rsvd_bits, u64 efer,
 				     ulong cr4, u64 guest_efer, ulong guest_cr4)
 {
@@ -473,6 +555,7 @@ static struct svm_test npt_tests[] = {
 	NPT_V1_TEST(npt_rw_pfwalk, npt_rw_pfwalk_prepare, null_test, npt_rw_pfwalk_check),
 	NPT_V1_TEST(npt_l1mmio, npt_l1mmio_prepare, npt_l1mmio_test, npt_l1mmio_check),
 	NPT_V1_TEST(npt_rw_l1mmio, npt_rw_l1mmio_prepare, npt_rw_l1mmio_test, npt_rw_l1mmio_check),
+	NPT_V2_TEST(svm_decode_assist_npt_test),
 	NPT_V2_TEST(svm_npt_rsvd_bits_test),
 	{ NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
